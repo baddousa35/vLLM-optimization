@@ -1,55 +1,40 @@
-ORFEO vLLM Inference Optimization
+# README — How to run an eval + log memory + generate CSVs
 
-This repository contains the work produced during my internship at Area Science Park (LADE) on the ORFEO HPC/AI platform. The goal is to benchmark, analyze, and optimize LLM inference served with vLLM on a Kubernetes GPU cluster, focusing on the trade-off between throughput/latency, GPU memory usage, and benchmark accuracy.
+This project follows a simple workflow for each run **X**:
 
-Key objectives
+1) Launch the evaluation 
+2) Log memory/GPU metrics while it runs
+3) Stop logging when the run ends
+4) Generate CSV files from the logs
 
-Deploy and operate vLLM OpenAI-compatible endpoints on Kubernetes.
+---
 
-Measure performance under load (throughput, latency p50/p95/p99, error rate) using Locust.
+## Run ID
 
-Measure model quality using lm-evaluation-harness on standard tasks (e.g., ARC, GSM8K, HellaSwag, TruthfulQA, WinoGrande).
+Each run is identified by an integer **X** (example: `1`, `2`, `3`, ...).
 
-Run controlled tuning experiments (grid / one-parameter-at-a-time) on inference parameters such as:
+---
 
-max_num_seqs
+## Step 1 — Start the evaluation
 
-max_num_batched_tokens
+In a terminal:
 
-enable_chunked_prefill
+./run-eval-X
 
-max_model_len
+## Step 2
 
-gpu_memory_utilization
+Open a second terminal while the eval is running:
 
-Generate clear plots and reports to support before vs after decisions.
+./log-memory-X
 
-What’s inside
+## Step 3
 
-Kubernetes manifests / deployment configs for vLLM services.
+Stop memory logging when the eval finishes
 
-Locust scripts to reproduce load scenarios.
+Ctrl + C
 
-Benchmarking scripts (run orchestration, CSV aggregation).
+## Step 4 — Generate CSVs from the run folder
 
-Analysis notebooks / Python scripts to generate plots and summarize results.
+After the run is done (and logging stopped), generate the CSVs:
 
-Reports and slides used to present findings and recommendations.
-
-Typical workflow (high level)
-
-Deploy vLLM on Kubernetes (baseline).
-
-Run Locust load tests → collect performance metrics.
-
-Run LM Eval → collect accuracy metrics.
-
-Aggregate results (CSV) → generate plots and trade-off analysis.
-
-Tune parameters → validate improvements (Before vs After).
-
-Status / next steps
-
-GPT optimization completed with measurable improvements in throughput/latency/memory.
-
-Qwen3 and Llama 4 tuning planned as next steps (time constraints during internship).
+python3 make_run_csvs.py runs/QWEN-run-<X>

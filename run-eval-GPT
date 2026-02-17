@@ -1,0 +1,428 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ==========================================================
+# run-eval-GPT
+# Benchmarks: arc_challenge, gsm8k, hellaswag, truthfulqa_mc2, winogrande
+# + perf tok/s probe (perf.json)
+# + optional GPU burn after each task to make GPU load visible
+# + writes active run id to runs/_active_run_id for the logger
+# ==========================================================
+
+# -------------------------
+# Config (override via env)
+# -------------------------
+VLLM_BASE="${VLLM_BASE:-http://127.0.0.1:8001}"
+MODEL_ID="${MODEL_ID:-openai/gpt-oss-120b}"
+
+# completions (recommended) | chat
+MODE="${MODE:-completions}"
+
+NUM_FEWSHOT="${NUM_FEWSHOT:-0}"
+
+# More load by default
+BATCH_SIZE="${BATCH_SIZE:-8}"
+NUM_CONCURRENT="${NUM_CONCURRENT:-8}"
+MAX_RETRIES="${MAX_RETRIES:-3}"
+
+# Keep limits reasonable (increase if you want longer)
+LIMIT_DEFAULT="${LIMIT_DEFAULT:-200}"
+LIMIT_ARC="${LIMIT_ARC:-$LIMIT_DEFAULT}"
+LIMIT_GSM8K="${LIMIT_GSM8K:-$LIMIT_DEFAULT}"
+LIMIT_HELLASWAG="${LIMIT_HELLASWAG:-$LIMIT_DEFAULT}"
+LIMIT_TRUTH="${LIMIT_TRUTH:-$LIMIT_DEFAULT}"
+LIMIT_WINO="${LIMIT_WINO:-$LIMIT_DEFAULT}"
+
+LOG_SAMPLES="${LOG_SAMPLES:-0}"   # 1 => enable --log_samples
+
+# ---- GPU burn (creates visible load spikes) ----
+OCCUPY_GPU="${OCCUPY_GPU:-1}"               # 0 to disable
+BURN_N_REQ="${BURN_N_REQ:-16}"
+BURN_CONCURRENCY="${BURN_CONCURRENCY:-8}"
+BURN_MAX_TOKENS="${BURN_MAX_TOKENS:-1024}"
+BURN_PROMPT="${BURN_PROMPT:-Write a detailed technical explanation of Kubernetes scheduling, with examples.}"
+BURN_TIMEOUT_S="${BURN_TIMEOUT_S:-180}"
+
+# ---- Perf probe (tok/s) at end ----
+PERF_ENABLE="${PERF_ENABLE:-1}"
+PERF_N_REQ="${PERF_N_REQ:-80}"
+PERF_CONCURRENCY="${PERF_CONCURRENCY:-16}"
+PERF_MAX_TOKENS="${PERF_MAX_TOKENS:-512}"
+PERF_PROMPT="${PERF_PROMPT:-Explain Kubernetes in 8 detailed bullet points with examples.}"
+PERF_TIMEOUT_S="${PERF_TIMEOUT_S:-180}"
+
+RUNS_DIR="${RUNS_DIR:-runs}"
+mkdir -p "${RUNS_DIR}"
+ACTIVE_FILE="${RUNS_DIR}/_active_run_id"
+
+# Normalize base url (strip trailing slash)
+VLLM_BASE="${VLLM_BASE%/}"
+
+# -------------------------
+# Auto-increment GPT-run-X
+# -------------------------
+next_run_num() {
+  local max=0
+  shopt -s nullglob
+  for d in "${RUNS_DIR}"/GPT-run-*; do
+    [[ -d "$d" ]] || continue
+    local base="${d##*/}"
+    local n="${base#GPT-run-}"
+    [[ "$n" =~ ^[0-9]+$ ]] || continue
+    (( n > max )) && max=$n
+  done
+  echo $((max + 1))
+}
+
+RUN_NUM="$(next_run_num)"
+RUN_ID="${RUN_ID:-GPT-run-${RUN_NUM}}"
+RUN_DIR="${RUNS_DIR}/${RUN_ID}"
+mkdir -p "${RUN_DIR}"
+
+cleanup_active() {
+  if [[ -f "$ACTIVE_FILE" ]] && [[ "$(cat "$ACTIVE_FILE" 2>/dev/null || true)" == "$RUN_ID" ]]; then
+    rm -f "$ACTIVE_FILE" || true
+  fi
+}
+trap cleanup_active EXIT
+
+echo "$RUN_ID" > "$ACTIVE_FILE"
+
+# -------------------------
+# Pre-flight
+# -------------------------
+command -v lm-eval >/dev/null 2>&1 || { echo "ERROR: lm-eval introuvable"; exit 1; }
+command -v curl >/dev/null 2>&1 || { echo "ERROR: curl introuvable"; exit 1; }
+
+if [[ "${MODE}" == "chat" ]]; then
+  BASE_URL="${VLLM_BASE}/v1/chat/completions"
+  APPLY_CHAT="--apply_chat_template"
+  MODEL_BACKEND="local-chat-completions"
+else
+  BASE_URL="${VLLM_BASE}/v1/completions"
+  APPLY_CHAT=""
+  MODEL_BACKEND="local-completions"
+fi
+
+echo "== Smoke tests =="
+curl -sf "${VLLM_BASE}/v1/models" >/dev/null || { echo "ERROR: ${VLLM_BASE}/v1/models inaccessible"; exit 1; }
+echo "OK"
+echo
+
+# -------------------------
+# Helper: run one task
+# -------------------------
+run_task () {
+  local name="$1"
+  local task="$2"
+  local limit="$3"
+
+  local out_dir="${RUN_DIR}/${name}"
+  local log_file="${RUN_DIR}/${name}.log"
+  mkdir -p "${out_dir}"
+
+  echo "== RUN ${name} ==" | tee "${log_file}"
+  echo "task=${task}" | tee -a "${log_file}"
+  echo "limit=${limit} batch_size=${BATCH_SIZE} fewshot=${NUM_FEWSHOT} concurrent=${NUM_CONCURRENT}" | tee -a "${log_file}"
+  echo "start_utc=$(date -u +%FT%TZ)" | tee -a "${log_file}"
+  echo | tee -a "${log_file}"
+
+  local log_samples_flag=""
+  if [[ "${LOG_SAMPLES}" == "1" ]]; then
+    log_samples_flag="--log_samples"
+  fi
+
+  set +e
+  lm-eval \
+    --model "${MODEL_BACKEND}" \
+    ${APPLY_CHAT} \
+    --tasks "${task}" \
+    --num_fewshot "${NUM_FEWSHOT}" \
+    --batch_size "${BATCH_SIZE}" \
+    --limit "${limit}" \
+    --model_args "model=${MODEL_ID},base_url=${BASE_URL},num_concurrent=${NUM_CONCURRENT},max_retries=${MAX_RETRIES}" \
+    --output_path "${out_dir}" \
+    ${log_samples_flag} \
+    2>&1 | tee -a "${log_file}"
+  rc=${PIPESTATUS[0]}
+  set -e
+
+  echo | tee -a "${log_file}"
+  echo "end_utc=$(date -u +%FT%TZ)" | tee -a "${log_file}"
+
+  if [[ "$rc" -ne 0 ]]; then
+    if grep -qE "Dataset scripts are no longer supported|Feature type 'List' not found" "${log_file}"; then
+      echo "[SKIP] ${name} (${task}) -> dataset incompatibility. rc=$rc" | tee -a "${RUN_DIR}/_skipped.txt"
+      return 0
+    fi
+    if grep -qE "KeyError:|Task .* not found|Could not find task" "${log_file}"; then
+      echo "[SKIP] ${name} (${task}) -> task not available. rc=$rc" | tee -a "${RUN_DIR}/_skipped.txt"
+      return 0
+    fi
+    echo "ERROR: ${name} failed (rc=$rc). See ${log_file}" >&2
+    exit "$rc"
+  fi
+}
+
+# -------------------------
+# GPU burn helper
+# -------------------------
+gpu_burn () {
+  [[ "${OCCUPY_GPU}" == "1" ]] || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+
+  # needs requests
+  if ! python3 - <<'PY' >/dev/null 2>&1
+import requests  # noqa
+PY
+  then
+    echo "NOTE: python3 requests not installed -> skipping GPU burn" | tee -a "${RUN_DIR}/_meta.txt"
+    return 0
+  fi
+
+  RUN_DIR="${RUN_DIR}" RUN_ID="${RUN_ID}" VLLM_BASE="${VLLM_BASE}" MODE="${MODE}" MODEL_ID="${MODEL_ID}" \
+  BURN_N_REQ="${BURN_N_REQ}" BURN_CONCURRENCY="${BURN_CONCURRENCY}" BURN_MAX_TOKENS="${BURN_MAX_TOKENS}" \
+  BURN_PROMPT="${BURN_PROMPT}" BURN_TIMEOUT_S="${BURN_TIMEOUT_S}" \
+  python3 - <<'PY'
+import os, time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import requests
+
+vllm_base = os.environ["VLLM_BASE"].rstrip("/")
+mode = os.environ["MODE"]
+model = os.environ["MODEL_ID"]
+n_req = int(os.environ["BURN_N_REQ"])
+conc  = int(os.environ["BURN_CONCURRENCY"])
+max_t = int(os.environ["BURN_MAX_TOKENS"])
+prompt = os.environ["BURN_PROMPT"]
+timeout_s = int(os.environ["BURN_TIMEOUT_S"])
+
+url = f"{vllm_base}/v1/chat/completions" if mode == "chat" else f"{vllm_base}/v1/completions"
+
+def one_call():
+  if mode == "chat":
+    payload = {"model": model, "messages":[{"role":"user","content":prompt}], "max_tokens": max_t, "temperature": 0}
+  else:
+    payload = {"model": model, "prompt": prompt, "max_tokens": max_t, "temperature": 0}
+  r = requests.post(url, json=payload, timeout=timeout_s)
+  return r.status_code
+
+t0 = time.perf_counter()
+oks = 0
+with ThreadPoolExecutor(max_workers=conc) as ex:
+  futs = [ex.submit(one_call) for _ in range(n_req)]
+  for f in as_completed(futs):
+    if f.result() == 200:
+      oks += 1
+dt = time.perf_counter() - t0
+print(f"[GPU_BURN] {oks}/{n_req} OK in {dt:.2f}s (url={url})")
+PY
+}
+
+# -------------------------
+# Meta
+# -------------------------
+{
+  echo "RUN_ID=${RUN_ID}"
+  echo "RUN_DIR=${RUN_DIR}"
+  echo "VLLM_BASE=${VLLM_BASE}"
+  echo "BASE_URL=${BASE_URL}"
+  echo "MODEL_ID=${MODEL_ID}"
+  echo "MODE=${MODE}"
+  echo "BATCH_SIZE=${BATCH_SIZE}"
+  echo "NUM_CONCURRENT=${NUM_CONCURRENT}"
+  echo "LIMIT_DEFAULT=${LIMIT_DEFAULT}"
+  echo "OCCUPY_GPU=${OCCUPY_GPU}"
+  echo "start_utc=$(date -u +%FT%TZ)"
+} | tee "${RUN_DIR}/_meta.txt"
+
+# -------------------------
+# 5 benchmarks requested
+# -------------------------
+run_task "arc_challenge" "arc_challenge"   "${LIMIT_ARC}"
+gpu_burn
+
+run_task "gsm8k"         "gsm8k"           "${LIMIT_GSM8K}"
+gpu_burn
+
+run_task "hellaswag"     "hellaswag"       "${LIMIT_HELLASWAG}"
+gpu_burn
+
+run_task "truthfulqa"    "truthfulqa_mc2"  "${LIMIT_TRUTH}"
+gpu_burn
+
+run_task "winogrande"    "winogrande"      "${LIMIT_WINO}"
+gpu_burn
+
+echo "end_utc=$(date -u +%FT%TZ)" | tee -a "${RUN_DIR}/_meta.txt"
+
+# -------------------------
+# Build accuracy.json
+# -------------------------
+if command -v python3 >/dev/null 2>&1; then
+  RUN_DIR="${RUN_DIR}" RUN_ID="${RUN_ID}" python3 - <<'PY'
+import os, json, glob
+run_dir = os.environ["RUN_DIR"]
+run_id  = os.environ["RUN_ID"]
+tasks = ["arc_challenge","gsm8k","hellaswag","truthfulqa","winogrande"]
+summary = {"run_id": run_id, "run_dir": run_dir, "tasks": {}}
+
+def load_results(task_dir):
+  candidates = []
+  for pat in ("results.json", "results*.json", "*.json"):
+    candidates += glob.glob(os.path.join(task_dir, pat))
+  for path in sorted(set(candidates)):
+    try:
+      with open(path, "r") as f:
+        data = json.load(f)
+    except Exception:
+      continue
+    if isinstance(data, dict) and ("results" in data or "versions" in data):
+      return data
+  return None
+
+for t in tasks:
+  td = os.path.join(run_dir, t)
+  if not os.path.isdir(td):
+    continue
+  data = load_results(td)
+  if not data:
+    continue
+  if isinstance(data, dict) and "results" in data and isinstance(data["results"], dict):
+    if t in data["results"]:
+      summary["tasks"][t] = data["results"][t]
+    elif len(data["results"]) == 1:
+      summary["tasks"][t] = next(iter(data["results"].values()))
+    else:
+      summary["tasks"][t] = data["results"]
+  else:
+    summary["tasks"][t] = data
+
+out_path = os.path.join(run_dir, "accuracy.json")
+with open(out_path, "w") as f:
+  json.dump(summary, f, indent=2, sort_keys=True)
+print(f"Wrote {out_path}")
+PY
+fi
+
+# -------------------------
+# Perf probe (tok/s) -> perf.json (+ merge into accuracy.json)
+# -------------------------
+if [[ "${PERF_ENABLE}" == "1" ]] && command -v python3 >/dev/null 2>&1; then
+  if python3 - <<'PY' >/dev/null 2>&1
+import requests  # noqa
+PY
+  then
+    RUN_DIR="${RUN_DIR}" RUN_ID="${RUN_ID}" VLLM_BASE="${VLLM_BASE}" MODE="${MODE}" MODEL_ID="${MODEL_ID}" \
+    PERF_N_REQ="${PERF_N_REQ}" PERF_CONCURRENCY="${PERF_CONCURRENCY}" PERF_MAX_TOKENS="${PERF_MAX_TOKENS}" \
+    PERF_PROMPT="${PERF_PROMPT}" PERF_TIMEOUT_S="${PERF_TIMEOUT_S}" \
+    python3 - <<'PY'
+import os, time, json
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import requests
+
+run_dir = os.environ["RUN_DIR"]
+run_id  = os.environ["RUN_ID"]
+vllm_base = os.environ["VLLM_BASE"].rstrip("/")
+mode = os.environ["MODE"]
+model = os.environ["MODEL_ID"]
+
+n_req = int(os.environ["PERF_N_REQ"])
+conc  = int(os.environ["PERF_CONCURRENCY"])
+max_t = int(os.environ["PERF_MAX_TOKENS"])
+prompt = os.environ["PERF_PROMPT"]
+timeout_s = int(os.environ["PERF_TIMEOUT_S"])
+
+url = f"{vllm_base}/v1/chat/completions" if mode == "chat" else f"{vllm_base}/v1/completions"
+
+def pct(xs, p):
+  if not xs: return None
+  s = sorted(xs)
+  k = (len(s)-1) * (p/100.0)
+  f = int(k); c = min(f+1, len(s)-1)
+  if f == c: return float(s[f])
+  return float(s[f] + (s[c]-s[f]) * (k-f))
+
+def one_call():
+  if mode == "chat":
+    payload = {"model": model, "messages":[{"role":"user","content": prompt}], "max_tokens": max_t, "temperature": 0}
+  else:
+    payload = {"model": model, "prompt": prompt, "max_tokens": max_t, "temperature": 0}
+  t0 = time.perf_counter()
+  r = requests.post(url, json=payload, timeout=timeout_s)
+  dt = time.perf_counter() - t0
+  if r.status_code != 200:
+    return {"ok": False, "lat": dt, "usage": {}}
+  try:
+    j = r.json()
+    usage = j.get("usage") or {}
+  except Exception:
+    return {"ok": False, "lat": dt, "usage": {}}
+  return {"ok": True, "lat": dt, "usage": usage}
+
+t_wall0 = time.perf_counter()
+results = []
+with ThreadPoolExecutor(max_workers=conc) as ex:
+  futs = [ex.submit(one_call) for _ in range(n_req)]
+  for f in as_completed(futs):
+    results.append(f.result())
+t_wall = time.perf_counter() - t_wall0
+
+oks = [x for x in results if x["ok"]]
+lat = [x["lat"] for x in oks]
+
+pt, ct, tt = [], [], []
+for x in oks:
+  u = x.get("usage") or {}
+  if "prompt_tokens" in u and "completion_tokens" in u and "total_tokens" in u:
+    pt.append(int(u["prompt_tokens"]))
+    ct.append(int(u["completion_tokens"]))
+    tt.append(int(u["total_tokens"]))
+
+perf = {
+  "run_id": run_id,
+  "endpoint": url,
+  "mode": mode,
+  "model": model,
+  "probe": {"n_requests": n_req, "concurrency": conc, "max_tokens": max_t, "timeout_s": timeout_s},
+  "success": {"ok": len(oks), "failed": n_req - len(oks)},
+  "latency_s": {"p50": pct(lat,50), "p95": pct(lat,95), "p99": pct(lat,99), "mean": (sum(lat)/len(lat)) if lat else None},
+  "usage_tokens": {
+    "have_usage": bool(tt),
+    "sum_prompt_tokens": sum(pt) if pt else None,
+    "sum_completion_tokens": sum(ct) if ct else None,
+    "sum_total_tokens": sum(tt) if tt else None
+  },
+  "throughput_tok_s": {
+    "prompt_tok_s": (sum(pt)/t_wall) if pt else None,
+    "completion_tok_s": (sum(ct)/t_wall) if ct else None,
+    "total_tok_s": (sum(tt)/t_wall) if tt else None
+  },
+  "wall_time_s": t_wall
+}
+
+out_perf = os.path.join(run_dir, "perf.json")
+with open(out_perf, "w") as f:
+  json.dump(perf, f, indent=2, sort_keys=True)
+
+acc_path = os.path.join(run_dir, "accuracy.json")
+if os.path.exists(acc_path):
+  try:
+    with open(acc_path, "r") as f:
+      acc = json.load(f)
+    acc["perf"] = perf
+    with open(acc_path, "w") as f:
+      json.dump(acc, f, indent=2, sort_keys=True)
+  except Exception:
+    pass
+
+print(f"Wrote {out_perf}")
+print(f"Probe total_tok/s={perf['throughput_tok_s']['total_tok_s']}")
+if not perf["usage_tokens"]["have_usage"]:
+  print("WARNING: No 'usage' in responses -> tok/s is NA.")
+PY
+  fi
+fi
+
+echo "DONE. Results in ${RUN_DIR}"
+echo "${RUN_ID}"

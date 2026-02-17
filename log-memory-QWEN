@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+NAMESPACE="${NAMESPACE:-vllm}"
+RUNS_DIR="${RUNS_DIR:-runs}"
+
+# Logging interval (file) in seconds
+INTERVAL_S="${INTERVAL_S:-10}"
+
+# Spike view sampling interval in ms
+SPIKE_MS="${SPIKE_MS:-200}"
+
+# If set, will try to stick to this pod (unless POD_LOCK=0)
+POD="${POD:-}"
+POD_LOCK="${POD_LOCK:-0}"   # 1 = keep fixed POD, 0 = auto-follow (default)
+
+# Pattern to select the QWEN pod name (override if needed)
+# Examples you might use: qwen, qwen3, Qwen3, qwen3-vl, etc.
+POD_MATCH="${POD_MATCH:-qwen}"
+
+mkdir -p "$RUNS_DIR"
+ACTIVE_FILE="${RUNS_DIR}/_active_run_id"
+
+usage() {
+  echo "Usage:"
+  echo "  ./log-memory-QWEN                 # log toutes les ${INTERVAL_S}s dans runs/QWEN-run-X/memory-QWEN-run-X.csv"
+  echo "  ./log-memory-QWEN --spike-view    # live view (${SPIKE_MS}ms) pour voir les spikes (pod auto)"
+  echo
+  echo "Env vars utiles:"
+  echo "  NAMESPACE=vllm RUNS_DIR=runs INTERVAL_S=10 SPIKE_MS=200"
+  echo "  POD_MATCH=qwen     (filtre le bon pod)"
+  echo "  POD=... POD_LOCK=1 (si tu veux forcer un pod fixe)"
+  echo "  RUN_ID=QWEN-run-12"
+}
+
+next_run_num() {
+  local max=0
+  shopt -s nullglob
+  for d in "${RUNS_DIR}"/QWEN-run-*; do
+    [[ -d "$d" ]] || continue
+    local base="${d##*/}"
+    local n="${base#QWEN-run-}"
+    [[ "$n" =~ ^[0-9]+$ ]] || continue
+    (( n > max )) && max=$n
+  done
+  echo $((max + 1))
+}
+
+# Find the current Running pod for QWEN
+find_pod() {
+  kubectl -n "$NAMESPACE" get pods --no-headers 2>/dev/null \
+  | awk -v m="$POD_MATCH" '$1 ~ m && $3=="Running"{print $1; exit}'
+}
+
+# Determine RUN_ID
+RUN_ID="${RUN_ID:-}"
+if [[ -z "$RUN_ID" ]] && [[ -f "$ACTIVE_FILE" ]]; then
+  RUN_ID="$(cat "$ACTIVE_FILE" 2>/dev/null || true)"
+fi
+if [[ -z "$RUN_ID" ]]; then
+  RUN_ID="QWEN-run-$(next_run_num)"
+fi
+
+RUN_DIR="${RUNS_DIR}/${RUN_ID}"
+mkdir -p "${RUN_DIR}"
+
+MODE="${1:-}"
+if [[ "$MODE" == "--help" || "$MODE" == "-h" ]]; then
+  usage
+  exit 0
+fi
+
+# Determine initial POD (auto unless user forced it)
+if [[ -z "$POD" ]]; then
+  POD="$(find_pod || true)"
+fi
+
+if [[ "$MODE" == "--spike-view" ]]; then
+  if [[ -z "$POD" ]]; then
+    echo "ERROR: impossible de trouver un pod Running match='$POD_MATCH' dans namespace '$NAMESPACE'." >&2
+    exit 1
+  fi
+  echo "RUN_ID=$RUN_ID"
+  echo "Spike view pod=$POD namespace=$NAMESPACE every ${SPIKE_MS}ms"
+  echo "Stop: Ctrl+C"
+  exec kubectl -n "$NAMESPACE" exec "pod/$POD" -- \
+    nvidia-smi --query-gpu=index,utilization.gpu,memory.used,power.draw,temperature.gpu \
+      --format=csv,noheader,nounits -lms "$SPIKE_MS"
+fi
+
+# Default: log to file every INTERVAL_S
+OUT="${RUN_DIR}/memory-${RUN_ID}.csv"
+echo "utc_ts,pod,gpu_index,mem_used_MiB,mem_total_MiB,gpu_util_pct,mem_util_pct,power_W,temp_C" > "$OUT"
+
+echo "RUN_ID=$RUN_ID"
+echo "Logging namespace=$NAMESPACE every ${INTERVAL_S}s (auto-follow pod match='$POD_MATCH')"
+echo "Output: $OUT"
+echo "Stop: Ctrl+C"
+
+cleanup() {
+  echo "$(date -u +%FT%TZ),${POD:-NO_POD},END,,,,,,," >> "$OUT" || true
+}
+trap cleanup EXIT
+
+while true; do
+  TS="$(date -u +%FT%TZ)"
+
+  # Auto-follow pod (recommended). If POD_LOCK=1 and POD set, keep it fixed.
+  if [[ "$POD_LOCK" != "1" ]]; then
+    POD_NEW="$(find_pod || true)"
+    if [[ -n "$POD_NEW" && "$POD_NEW" != "${POD:-}" ]]; then
+      # marker: pod changed
+      echo "${TS},${POD_NEW},INFO,,,,,,," >> "$OUT"
+      POD="$POD_NEW"
+    elif [[ -z "${POD:-}" && -n "$POD_NEW" ]]; then
+      POD="$POD_NEW"
+    fi
+  fi
+
+  if [[ -z "${POD:-}" ]]; then
+    echo "${TS},NO_POD,ERROR,,,,,,," >> "$OUT"
+    sleep "$INTERVAL_S"
+    continue
+  fi
+
+  if ! kubectl -n "$NAMESPACE" --request-timeout=5s exec "pod/$POD" -- \
+    nvidia-smi --query-gpu=index,memory.used,memory.total,utilization.gpu,utilization.memory,power.draw,temperature.gpu \
+      --format=csv,noheader,nounits 2>/dev/null \
+    | awk -v ts="$TS" -v pod="$POD" -F', *' '{print ts "," pod "," $1 "," $2 "," $3 "," $4 "," $5 "," $6 "," $7}' >> "$OUT"
+  then
+    echo "${TS},${POD},ERROR,,,,,,," >> "$OUT"
+  fi
+
+  sleep "$INTERVAL_S"
+done
